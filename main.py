@@ -1,520 +1,165 @@
-# app.py
-from typing import Optional, List
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, EmailStr, validator
-from bson import ObjectId
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_jwt_extended import (
+    JWTManager, create_access_token, create_refresh_token,
+    jwt_required, get_jwt_identity
+)
 from pymongo import MongoClient
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordRequestForm
-from datetime import datetime, timedelta
-import bcrypt
-from fastapi_jwt_auth import AuthJWT
 from pymongo.errors import DuplicateKeyError
+from bson import ObjectId
 from bson.errors import InvalidId
+from datetime import timedelta, datetime
+import bcrypt
 import os
-from fastapi.middleware.cors import CORSMiddleware
 
+app = Flask(__name__)
+CORS(app)
 
+# Config
+app.config['JWT_SECRET_KEY'] = os.getenv("JWT_SECRET_KEY", "your-secret-key-here")
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(seconds=3600)
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(seconds=86400)
 
-# App initialization
-app = FastAPI()
+jwt = JWTManager(app)
 
-# MongoDB connection
+# Mongo setup
 client = MongoClient("mongodb+srv://dbuser:Ashar123@cluster0.1cquqzc.mongodb.net/")
 db = client["lms"]
 
-# Create indexes on startup
+# Helpers
+def format_lead(doc):
+    doc["_id"] = str(doc["_id"])
+    return doc
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def validate_aadhaar(aadhaar):
+    return aadhaar.isdigit() and len(aadhaar) == 12
 
-# JWT Settings
-class Settings(BaseModel):
-    authjwt_secret_key: str = os.getenv("JWT_SECRET_KEY", "your-secret-key-here")
-    authjwt_access_token_expires: timedelta = timedelta(seconds=3600)
-    authjwt_refresh_token_expires: timedelta = timedelta(seconds=86400)
+def validate_pan(pan):
+    return len(pan) == 10 and pan[:5].isalpha() and pan[5:9].isdigit() and pan[9].isalpha()
 
-@AuthJWT.load_config
-def get_config():
-    return Settings()
-
-# Pydantic models
-class LeadIn(BaseModel):
-    aadhaar_no: str = Field(..., description="12-digit Aadhaar number")
-    pan_no: str = Field(..., description="10-character PAN number")
-    last_name: str = Field(..., description="Last name of the lead")
-    address: Optional[str] = Field(None, description="Address of the lead")
-    email: EmailStr = Field(..., description="Email address")
-    contact: str = Field(..., description="Contact phone number")
-
-    @validator('aadhaar_no')
-    def validate_aadhaar(cls, v):
-        if not v.isdigit() or len(v) != 12:
-            raise ValueError('Aadhaar must be exactly 12 digits')
-        return v
-
-    @validator('pan_no')
-    def validate_pan(cls, v):
-        if len(v) != 10 or not v[:5].isalpha() or not v[5:9].isdigit() or not v[9].isalpha():
-            raise ValueError('PAN must be 10 characters: 5 letters, 4 digits, 1 letter')
-        return v.upper()
-
-class LeadOut(LeadIn):
-    id: str = Field(..., alias="_id")
-
-class GenericResponse(BaseModel):
-    success: bool
-    message: str
-    data: Optional[object] = None
-    errorMessage: Optional[str] = None
-
-class SignupPayload(BaseModel):
-    firstName: str
-    lastName: str
-    email: EmailStr
-    password: str
-    assignedRole: Optional[List[str]] = None
-
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-class LoginResponse(GenericResponse):
-    access_token:str
-    refresh_token:str
-
-# Auth Service Implementation
-class AuthServiceImpl:
-    def validate_cred(self, body):
-        user = db.users.find_one({"email": body["email"]})
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "success": False,
-                    "message": "Login failed",
-                    "errorMessage": "Invalid email"
-                }
-            )
-        if not bcrypt.checkpw(body["password"].encode('utf-8'), user["password"]):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "success": False,
-                    "message": "Login failed",
-                    "errorMessage": "Invalid password"
-                }
-            )
-        return user
-
-# Permission dependency
-def PermissionRequired(permission: str):
-    def dependency(Authorize: AuthJWT = Depends()):
-        try:
-            Authorize.jwt_required()
-            user_id = Authorize.get_jwt_subject()
-            user = db.users.find_one({"_id": ObjectId(user_id)})
-            if not user or permission not in user.get("assignedRole", []):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail={
-                        "success": False,
-                        "message": "Permission denied",
-                        "errorMessage": "You don't have permission to access this resource"
-                    }
-                )
-            return user
-        except InvalidId:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={
-                    "success": False,
-                    "message": "Invalid user",
-                    "errorMessage": "Invalid user ID"
-                }
-            )
-    return Depends(dependency)
-
-# Routes
-lead_router = APIRouter(prefix="/core/api/leads", tags=["leads"])
-auth_router = APIRouter(prefix="/core/api/auth", tags=["auth"])
-
-@auth_router.post("/signup", response_model=GenericResponse)
-async def signup(payload: SignupPayload, _ = PermissionRequired("USER:CREATE")):
+# Auth endpoints
+@app.route("/core/api/auth/signup", methods=["POST"])
+@jwt_required(optional=True)
+def signup():
     try:
-        salt = bcrypt.gensalt()
-        hashed_password = bcrypt.hashpw(payload.password.encode('utf-8'), salt)
+        data = request.json
+        password_hash = bcrypt.hashpw(data["password"].encode("utf-8"), bcrypt.gensalt())
         user_data = {
-            "firstName": payload.firstName,
-            "lastName": payload.lastName,
-            "email": payload.email,
-            "password": hashed_password,
+            "firstName": data["firstName"],
+            "lastName": data["lastName"],
+            "email": data["email"],
+            "password": password_hash,
             "createdOn": datetime.now(),
             "updatedOn": datetime.now(),
             "status": "Active",
-            "assignedRole": payload.assignedRole or []
+            "assignedRole": data.get("assignedRole", [])
         }
-        result = db.users.insert_one(user_data)
-        return GenericResponse(
-            success=True,
-            message="User created successfully",
-            data={"id": str(result.inserted_id)}
-        )
+        db.users.insert_one(user_data)
+        return jsonify(success=True, message="User created successfully"), 201
     except DuplicateKeyError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "success": False,
-                "message": "Signup failed",
-                "errorMessage": "User already exists"
-            }
-        )
+        return jsonify(success=False, message="Signup failed", errorMessage="User already exists"), 400
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "success": False,
-                "message": "Signup failed",
-                "errorMessage": str(e)
-            }
-        )
+        return jsonify(success=False, message="Signup failed", errorMessage=str(e)), 500
 
-@auth_router.post("/login", response_model=LoginResponse)
-async def login(request: LoginRequest, Authorize: AuthJWT = Depends()):
+@app.route("/core/api/auth/login", methods=["POST"])
+def login():
     try:
-        auth_service = AuthServiceImpl()
-        user = auth_service.validate_cred(request.dict())
-        access_token = Authorize.create_access_token(subject=str(user["_id"]))
-        refresh_token = Authorize.create_refresh_token(subject=str(user["_id"]))
-        return LoginResponse(
-            success=True,
-            message="Login successful",
-            access_token=access_token,
-            refresh_token=refresh_token
-        )
-    except HTTPException as e:
-        raise e
+        data = request.json
+        user = db.users.find_one({"email": data["email"]})
+        if not user or not bcrypt.checkpw(data["password"].encode("utf-8"), user["password"]):
+            return jsonify(success=False, message="Login failed", errorMessage="Invalid credentials"), 400
+
+        user_id = str(user["_id"])
+        access_token = create_access_token(identity=user_id)
+        refresh_token = create_refresh_token(identity=user_id)
+        return jsonify(success=True, message="Login successful", access_token=access_token, refresh_token=refresh_token)
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "success": False,
-                "message": "Login failed",
-                "errorMessage": str(e)
-            }
-        )
+        return jsonify(success=False, message="Login failed", errorMessage=str(e)), 500
 
-@auth_router.get("/refresh", response_model=LoginResponse)
-async def refresh_token(Authorize: AuthJWT = Depends()):
+@app.route("/core/api/auth/refresh", methods=["GET"])
+@jwt_required(refresh=True)
+def refresh_token():
+    identity = get_jwt_identity()
+    access_token = create_access_token(identity=identity)
+    return jsonify(success=True, message="Token refreshed", access_token=access_token)
+
+# Lead routes
+@app.route("/core/api/leads", methods=["POST"])
+@jwt_required()
+def create_lead():
     try:
-        Authorize.jwt_refresh_token_required()
-        current_user = Authorize.get_jwt_subject()
-        new_access_token = Authorize.create_access_token(subject=current_user)
-        return LoginResponse(
-            success=True,
-            message="Token refreshed",
-            data={"access_token": new_access_token}
-        )
+        data = request.json
+        if not validate_aadhaar(data["aadhaar_no"]):
+            return jsonify(success=False, message="Creation failed", errorMessage="Invalid Aadhaar"), 400
+        if not validate_pan(data["pan_no"]):
+            return jsonify(success=False, message="Creation failed", errorMessage="Invalid PAN"), 400
+
+        if db.leads.find_one({"aadhaar_no": data["aadhaar_no"]}) or db.leads.find_one({"pan_no": data["pan_no"]}):
+            return jsonify(success=False, message="Creation failed", errorMessage="Duplicate Aadhaar or PAN"), 400
+
+        result = db.leads.insert_one(data)
+        created = db.leads.find_one({"_id": result.inserted_id})
+        return jsonify(success=True, message="Lead created", data=format_lead(created)), 201
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={
-                "success": False,
-                "message": "Refresh failed",
-                "errorMessage": "Invalid refresh token"
-            }
-        )
+        return jsonify(success=False, message="Creation failed", errorMessage=str(e)), 500
 
-# Ping endpoint
-@app.get("/ping", response_model=GenericResponse)
-async def ping():
-    return GenericResponse(success=True, message="pong")
-#
-# # Lead routes
-# @lead_router.post("/leads", response_model=GenericResponse, status_code=status.HTTP_201_CREATED)
-# def create_lead(lead: LeadIn):
-#     try:
-#         if db.leads.find_one({"aadhaar_no": lead.aadhaar_no}):
-#             raise HTTPException(
-#                 status_code=status.HTTP_400_BAD_REQUEST,
-#                 detail={
-#                     "success": False,
-#                     "message": "Creation failed",
-#                     "errorMessage": "Aadhaar number already exists"
-#                 }
-#             )
-#         if db.leads.find_one({"pan_no": lead.pan_no}):
-#             raise HTTPException(
-#                 status_code=status.HTTP_400_BAD_REQUEST,
-#                 detail={
-#                     "success": False,
-#                     "message": "Creation failed",
-#                     "errorMessage": "PAN number already exists"
-#                 }
-#             )
-#         doc = lead.dict()
-#         res = db.leads.insert_one(doc)
-#         created = db.leads.find_one({"_id": res.inserted_id})
-#         return GenericResponse(
-#             success=True,
-#             message="Lead created successfully",
-#             data=str(created["_id"])
-#         )
-#     except HTTPException as e:
-#         raise e
-#     except Exception as e:
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail={
-#                 "success": False,
-#                 "message": "Creation failed",
-#                 "errorMessage": str(e)
-#             }
-#         )
-
-# Include other lead routes (GET, PUT, DELETE) similarly...
-# ... (keep all previous imports and setup from your original code)
-
-# Add these to the existing imports
-from bson.errors import InvalidId
-
-
-# Helper to format Mongo document (add this above the lead routes)
-def format_lead(doc) -> LeadOut:
-    doc['_id'] = str(doc['_id'])
-    return LeadOut(**doc)
-
-
-# Update existing lead routes with the new endpoints
-@lead_router.get("/", response_model=GenericResponse)
-def list_leads(limit: int = 100, skip: int = 0):
+@app.route("/core/api/leads", methods=["GET"])
+@jwt_required()
+def list_leads():
     try:
-        cursor = db.leads.find().skip(skip).limit(limit)
-        leads = [format_lead(doc).dict(by_alias=True) for doc in cursor]
-        return GenericResponse(
-            success=True,
-            message="Leads retrieved successfully",
-            data=leads
-        )
+        skip = int(request.args.get("skip", 0))
+        limit = int(request.args.get("limit", 100))
+        leads = db.leads.find().skip(skip).limit(limit)
+        return jsonify(success=True, message="Leads retrieved", data=[format_lead(lead) for lead in leads])
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "success": False,
-                "message": "Retrieval failed",
-                "errorMessage": str(e)
-            }
-        )
+        return jsonify(success=False, message="Retrieval failed", errorMessage=str(e)), 500
 
-
-@lead_router.get("/{lead_id}", response_model=GenericResponse)
-def get_lead(lead_id: str):
+@app.route("/core/api/leads/<lead_id>", methods=["GET"])
+@jwt_required()
+def get_lead(lead_id):
     try:
-        oid = ObjectId(lead_id)
-        doc = db.leads.find_one({"_id": oid})
-        if not doc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "success": False,
-                    "message": "Retrieval failed",
-                    "errorMessage": "Lead not found"
-                }
-            )
-        lead_out = format_lead(doc)
-        return GenericResponse(
-            success=True,
-            message="Lead retrieved successfully",
-            data=lead_out.dict(by_alias=True)
-        )
+        lead = db.leads.find_one({"_id": ObjectId(lead_id)})
+        if not lead:
+            return jsonify(success=False, message="Lead not found", errorMessage="Lead not found"), 404
+        return jsonify(success=True, message="Lead retrieved", data=format_lead(lead))
     except InvalidId:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "success": False,
-                "message": "Invalid lead ID",
-                "errorMessage": "Invalid lead ID format"
-            }
-        )
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "success": False,
-                "message": "Retrieval failed",
-                "errorMessage": str(e)
-            }
-        )
+        return jsonify(success=False, message="Invalid lead ID", errorMessage="Invalid lead ID format"), 400
 
-
-@lead_router.put("/{lead_id}", response_model=GenericResponse)
-def update_lead(lead_id: str, lead: LeadIn):
+@app.route("/core/api/leads/<lead_id>", methods=["PUT"])
+@jwt_required()
+def update_lead(lead_id):
     try:
+        data = request.json
         oid = ObjectId(lead_id)
-        update_data = lead.dict()
 
-        # Check for existing Aadhaar/PAN in other documents
-        existing_aadhaar = db.leads.find_one({
-            "aadhaar_no": update_data["aadhaar_no"],
-            "_id": {"$ne": oid}
-        })
-        if existing_aadhaar:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "success": False,
-                    "message": "Update failed",
-                    "errorMessage": "Aadhaar number already exists"
-                }
-            )
+        if db.leads.find_one({"aadhaar_no": data["aadhaar_no"], "_id": {"$ne": oid}}):
+            return jsonify(success=False, message="Update failed", errorMessage="Duplicate Aadhaar"), 400
+        if db.leads.find_one({"pan_no": data["pan_no"], "_id": {"$ne": oid}}):
+            return jsonify(success=False, message="Update failed", errorMessage="Duplicate PAN"), 400
 
-        existing_pan = db.leads.find_one({
-            "pan_no": update_data["pan_no"],
-            "_id": {"$ne": oid}
-        })
-        if existing_pan:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "success": False,
-                    "message": "Update failed",
-                    "errorMessage": "PAN number already exists"
-                }
-            )
-
-        result = db.leads.update_one({"_id": oid}, {"$set": update_data})
+        result = db.leads.update_one({"_id": oid}, {"$set": data})
         if result.matched_count == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "success": False,
-                    "message": "Update failed",
-                    "errorMessage": "Lead not found"
-                }
-            )
+            return jsonify(success=False, message="Update failed", errorMessage="Lead not found"), 404
 
-        doc = db.leads.find_one({"_id": oid})
-        lead_out = format_lead(doc)
-        return GenericResponse(
-            success=True,
-            message="Lead updated successfully",
-            data=lead_out.dict(by_alias=True))
+        updated = db.leads.find_one({"_id": oid})
+        return jsonify(success=True, message="Lead updated", data=format_lead(updated))
     except InvalidId:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "success": False,
-                "message": "Invalid lead ID",
-                "errorMessage": "Invalid lead ID format"
-            }
-        )
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "success": False,
-                "message": "Update failed",
-                "errorMessage": str(e)
-            }
-        )
+        return jsonify(success=False, message="Invalid lead ID", errorMessage="Invalid lead ID format"), 400
 
-
-@lead_router.delete("/{lead_id}", response_model=GenericResponse)
-def delete_lead(lead_id: str):
+@app.route("/core/api/leads/<lead_id>", methods=["DELETE"])
+@jwt_required()
+def delete_lead(lead_id):
     try:
-        oid = ObjectId(lead_id)
-        result = db.leads.delete_one({"_id": oid})
+        result = db.leads.delete_one({"_id": ObjectId(lead_id)})
         if result.deleted_count == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "success": False,
-                    "message": "Deletion failed",
-                    "errorMessage": "Lead not found"
-                }
-            )
-        return GenericResponse(
-            success=True,
-            message="Lead deleted successfully"
-        )
+            return jsonify(success=False, message="Deletion failed", errorMessage="Lead not found"), 404
+        return jsonify(success=True, message="Lead deleted")
     except InvalidId:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "success": False,
-                "message": "Invalid lead ID",
-                "errorMessage": "Invalid lead ID format"
-            }
-        )
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "success": False,
-                "message": "Deletion failed",
-                "errorMessage": str(e)
-            }
-        )
+        return jsonify(success=False, message="Invalid lead ID", errorMessage="Invalid lead ID format"), 400
 
-
-# Update the existing create_lead endpoint to use format_lead
-@lead_router.post("/", response_model=GenericResponse, status_code=status.HTTP_201_CREATED)
-def create_lead(lead: LeadIn):
-    try:
-        if db.leads.find_one({"aadhaar_no": lead.aadhaar_no}):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "success": False,
-                    "message": "Creation failed",
-                    "errorMessage": "Aadhaar number already exists"
-                }
-            )
-        if db.leads.find_one({"pan_no": lead.pan_no}):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "success": False,
-                    "message": "Creation failed",
-                    "errorMessage": "PAN number already exists"
-                }
-            )
-        doc = lead.dict()
-        res = db.leads.insert_one(doc)
-        created = db.leads.find_one({"_id": res.inserted_id})
-        lead_out = format_lead(created)
-        return GenericResponse(
-            success=True,
-            message="Lead created successfully",
-            data=lead_out.dict(by_alias=True)
-        )
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "success": False,
-                "message": "Creation failed",
-                "errorMessage": str(e)
-            }
-        )
-
-
-app.include_router(lead_router)
-app.include_router(auth_router)
+@app.route("/ping", methods=["GET"])
+def ping():
+    return jsonify(success=True, message="pong")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    app.run(debug=True, port=8000)
